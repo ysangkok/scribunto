@@ -44,6 +44,7 @@ $wgAutoloadClasses['Scribunto'] = $dir.'common/Common.php';
 $wgAutoloadClasses['ApiScribuntoConsole'] = $dir.'common/ApiScribuntoConsole.php';
 $wgAutoloadClasses['ScribuntoContentHandler'] = $dir.'common/ScribuntoContentHandler.php';
 $wgAutoloadClasses['ScribuntoContent'] = $dir.'common/ScribuntoContent.php';
+$wgAutoloadClasses['ScribuntoRepo'] = $dir.'common/ScribuntoRepo.php';
 
 $wgHooks['SoftwareInfo'][] = 'ScribuntoHooks::getSoftwareInfo';
 
