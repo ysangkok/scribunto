@@ -2,72 +2,86 @@
 /*
 TODO
 
-- mtime / size
 - notimplemented issues?
 - errormsg i18n
-- cache engine
-- save to permanent storage and not tempfile
-- dependencies
-	- invalidate thumbnails on script update
-	- invalidate script output on script update
 */
 
 class ScribuntoFile extends File {
 	function __construct($title, $repo) {
 		if ( $title instanceof Title ) {
-			$this->title = File::normalizeTitle( $title, 'exception' );
+			$this->title = $title; //File::normalizeTitle( $title, 'exception' );
 			$this->name = $repo->getNameFromTitle( $title );
 		} else {
 			$this->name = basename( $path );
 			$this->title = File::normalizeTitle( $this->name, 'exception' );
 		}
 		$this->repo = $repo;
+		$this->hasData = false;
 	}
 
 	public static function newFromTitle($title, $repo) {
 		return new ScribuntoFile($title, $repo);
 	}
+
+	public static function newFromModuleTitle($title, $repo) {
+		$title = Title::newFromText("File:" . $title);
+		return new ScribuntoFile($title, $repo);
+	}
 	
 	public function getWidth($page = 1) {
-		list($fsFile, $w, $h, $mime) = ScribuntoBackend::execTitle($this->title);
-		return $w;
+		$this->ensureHasData();
+		return $this->w;
 	}
+
 	public function getHeight($page = 1) {
-		list($fsFile, $w, $h, $mime) = ScribuntoBackend::execTitle($this->title);
-		return $h;
+		$this->ensureHasData();
+		return $this->h;
 	}
+
 	public function getMimeType() {
-		list($fsFile, $w, $h, $mime) = ScribuntoBackend::execTitle($this->title);
-		return $mime;
+		$this->ensureHasData();
+		return $this->mime;
+	}
+
+	public function getSize() {
+		$this->ensureHasData();
+		return $this->numBytesWritten;
+	}
+
+	private function ensureHasData() {
+		if (!$this->hasData)
+			list($this->fsFile, $this->w, $this->h, $this->mime, $this->numBytesWritten) = $this->repo->getBackend()->execTitle(Title::newFromText($this->title->getDBKey()));
+		$this->hasData = true;
 	}
 }
 
-/*
 class Decorator 
 {
 	protected $foo;
 
-	function __construct($foo) {
+	function __construct($foo, $bucket = "default") {
 		$this->foo = $foo;
+		$this->bucket = $bucket;
 	}
 
 	function __call($method_name, $args) {
-		wfDebugLog('scrib5','CALL1 '. get_class($this->foo). " " .$method_name." with args " . json_encode($args));
+		wfDebugLog('scrib5',"{$this->bucket} CALL1 ". get_class($this->foo). " " .$method_name." with args " . json_encode($args));
 		$ret = call_user_func_array(array($this->foo, $method_name), $args);
-		wfDebugLog("scrib5","CALL2 ". get_class($this->foo). " ". var_export($ret,1));
+		wfDebugLog("scrib5","{$this->bucket} CALL2 ". get_class($this->foo). " ". var_export($ret,1));
 		return $ret;
 	}
 }
-*/
 
 class ScribuntoOutput extends UploadBase {
 	function __construct($path) {
 		parent::__construct();
 		$this->mTempPath = $path;
 	}
+
 	public function initializeFromRequest(&$request) {
 		throw new NotImplementedException();
 	}
+
 	public function verifyFile() {
 		global $wgVerifyMimeType;
 		$bu = $wgVerifyMimeType;
@@ -79,9 +93,11 @@ class ScribuntoOutput extends UploadBase {
 }
 
 class ScribuntoBackend extends FileBackendStore {
-	function __construct($config) {
+	function __construct($config, $repo) {
 		parent::__construct($config);
-		$this->thumbs = new FSFileBackend($config);
+		$this->repo = $repo;
+		$this->thumbs = new Decorator(new FSFileBackend($config));
+		$this->larges = new Decorator(new FSFileBackend(["name" => "scrib", "wikiId" => "donkeyballs", "containerPaths" => ["scrib-public" => "/home/janus/core/images"]]));
 	}
 
 	private static function n() {
@@ -92,7 +108,7 @@ class ScribuntoBackend extends FileBackendStore {
 		if (isset($params["dst"])) $key = "dst";
 		else if (isset($params["src"])) $key = "src";
 		else return;
-		$bucket = self::urlToTitle($params[$key])[0];
+		$bucket = self::urlToBucketAndTitle($params[$key])[0];
 		if (strpos($bucket, "thumb") === false) throw new MWException("can only store thumbnails (not in $bucket): " . print_r($params,1));
 	}
 
@@ -149,30 +165,44 @@ class ScribuntoBackend extends FileBackendStore {
 		self::n();
 	}
 
-	private static function urlToTitle($src) {
+	private static function urlToBucketAndTitle($src) {
 		$path = parse_url($src)["path"];
 		return [explode("/",$path)[1], Title::newFromText(basename($path))];
 		// ["scrib-thumb" , Title(Module:Bananas)]
 	}
 
 	protected function doGetFileStat( array $params ) {
-		list($bucket, $module) = self::urlToTitle($params["src"]);
+		list($bucket, $module) = self::urlToBucketAndTitle($params["src"]);
 		if (strpos($bucket, "thumb") !== false) {
-			return $this->thumbs->getFileStat($params);
+			$thumbStat = $this->thumbs->getFileStat($params);
+			$orgfile = strrev(explode("/",strrev(dirname(parse_url($params["src"])["path"])))[0]);
+			// mwstore://bla/bla/næst sidste/john
+			//                   ^^^^^^^^^^^ == Module:Bananas == orgfile
+			if ($thumbStat["mtime"] < (new WikiPage(Title::newFromText($orgfile)))->getTouched()) {
+				wfDebugLog(__METHOD__, "forced thumbnail regeneration: " . print_r($thumbStat,1));
+				$this->thumbs->quickDelete($params);
+				return $this->thumbs->getFileStat($params);
+			} else {
+				wfDebugLog(__METHOD__, "reused thumbnail: " . print_r($thumbStat,1));
+				return $thumbStat;
+			}
 		}
 		try {
 			self::checkCall($module);
-			return ["mtime" => 100, "size" => 42]; // TODO
+			$page = new WikiPage($module);
+			return ["mtime" => $page->getTouched(), "size" => $this->execTitle($module)[4]];
 		} catch (ScribuntoException $e) {
 			return null;
 		}
 	}
 
 	private static function mimeToExt($mime) {
-		return explode(" ", (new MimeMagic)->getExtensionsForType($mime))[0];
+		static $mimeMagic;
+		if (!$mimeMagic) $mimeMagic = new MimeMagic;
+		return explode(" ", $mimeMagic->getExtensionsForType($mime))[0];
 	}
 
-	static function execTitle($title) {
+	function execTitle($title) {
 		list($out, $w, $h, $mime) = self::execScript($title);
 		$ext = self::mimeToExt($mime);
 		// Create a new temporary file with the same extension...
@@ -189,7 +219,13 @@ class ScribuntoBackend extends FileBackendStore {
 			$fsFile = null;
 			throw new MWException("couldn't write file");
 		}
-		return [$fsFile, $w, $h, $mime];
+		$url = ScribuntoFile::newFromModuleTitle($title, $this->repo)->getPath();
+		$split = parse_url($url);
+		$split["path"] = dirname($split["path"]);
+		$newurl = self::unparse_url($split);
+		$this->larges->prepare(["dir" => $newurl]);
+		$this->larges->quickStore(["src" => $fsFile->getPath(), "dst" => $url]);
+		return [$fsFile, $w, $h, $mime, $bytes];
 	}
 
 	protected function doGetLocalCopyMulti( array $params ) {
@@ -197,7 +233,9 @@ class ScribuntoBackend extends FileBackendStore {
 		foreach ( $params['srcs'] as $src ) {
 			$fsFile = null;
 			if ( $src !== null && $this->doGetFileStat(["src" => $src])) {
-				list($fsFile, $_w, $_h, $_mime) = self::execTitle(self::urlToTitle($src)[1]);
+				list($bucket, $title) = self::urlToBucketAndTitle($src);
+				if (in_array($bucket, ["thumb", "archive", "deleted", "temp", "math"])) throw new MWException("unexpected bucket $bucket");
+				list($fsFile, $_w, $_h, $_mime, $_numBytesWritten) = self::execTitle($title);
 			}
 			$tmpFiles[$src] = $fsFile;
 		}
@@ -206,11 +244,13 @@ class ScribuntoBackend extends FileBackendStore {
 
 
 	private static function makeEngine( ) {
+		static $engine;
+		if ($engine) return $engine;
 		$parser = new Parser;
 		$options = new ParserOptions;
 		$options->setTemplateCallback( array( "Parser", 'statelessFetchTemplate' ) );
 		$parser->startExternalParse( Title::newMainPage(), $options, Parser::OT_HTML, true );
-		$engine = new Scribunto_LuaStandaloneEngine ( array( 'parser' => $parser ) + array( 'errorFile' => null, 'luaPath' => null, 'memoryLimit' => 50000000, 'cpuLimit' => 30, 'allowEnvFuncs' => true) );
+		$engine = new Scribunto_LuaStandaloneEngine ( array( 'parser' => $parser ) + array( 'errorFile' => null, 'luaPath' => null, 'memoryLimit' => 50000000, 'cpuLimit' => 5, 'allowEnvFuncs' => false) );
 		$parser->scribunto_engine = $engine;
 		$engine->setTitle( $parser->getTitle() );
 		$engine->getInterpreter();
@@ -219,9 +259,10 @@ class ScribuntoBackend extends FileBackendStore {
 
 	private static function checkCall($title) {
 		if ( !$title || $title->getNamespace() !== NS_MODULE || Scribunto::isDocPage( $title ) ) {
+			throw new MWException($title);
 			throw new ScribuntoException( 'scribunto-common-nosuchmodule' );
 		}
-		$engine = self::makeEngine(); // TODO cache
+		$engine = self::makeEngine();
 		$module = $engine->fetchModuleFromParser( $title );
 		if ( !$module ) {
 			throw new ScribuntoException( 'scribunto-common-nosuchmodule' );
@@ -236,9 +277,10 @@ class ScribuntoBackend extends FileBackendStore {
 			$mime = strval($module->invoke( "getMimeType", null ));
 			$width = intval($module->invoke( "getWidth", null ));
 			$height = intval($module->invoke( "getHeight", null ));
-		} catch (ScribuntoException $e) {
+			if ($width < 1 || $height < 1) throw new MWException("Width and height must be positive!");
+		} catch (Exception $e) {
 			$msg = $e->getMessage();
-			$width = 800;
+			$width = 500;
 			$height = 30;
 			$mime = "image/svg+xml";
 			$str = <<<END
@@ -256,8 +298,9 @@ class ScribuntoRepo extends FileRepo {
 	protected $fileFactory = array( 'ScribuntoFile', 'newFromTitle' );
 
 	function __construct($arr) {
-		parent::__construct($arr);
-		$this->backend = new ScribuntoBackend($arr);
+		parent::__construct($arr/* + ["hashLevels" => 0]*/); // this takes the "url" param
+		//xdebug_start_trace("/tmp/trace.out");
+		$this->backend = new ScribuntoBackend($arr, $this);
 	}
 
 	protected function assertWritableRepo() {
