@@ -1,4 +1,17 @@
 <?php
+/*
+TODO
+
+- mtime / size
+- notimplemented issues?
+- errormsg i18n
+- cache engine
+- save to permanent storage and not tempfile
+- dependencies
+	- invalidate thumbnails on script update
+	- invalidate script output on script update
+*/
+
 class ScribuntoFile extends File {
 	function __construct($title, $repo) {
 		if ( $title instanceof Title ) {
@@ -16,13 +29,16 @@ class ScribuntoFile extends File {
 	}
 	
 	public function getWidth($page = 1) {
-		return 100; // TODO
+		list($fsFile, $w, $h, $mime) = ScribuntoBackend::execTitle($this->title);
+		return $w;
 	}
 	public function getHeight($page = 1) {
-		return 100; // TODO
+		list($fsFile, $w, $h, $mime) = ScribuntoBackend::execTitle($this->title);
+		return $h;
 	}
 	public function getMimeType() {
-		return 'image/svg+xml'; // TODO
+		list($fsFile, $w, $h, $mime) = ScribuntoBackend::execTitle($this->title);
+		return $mime;
 	}
 }
 
@@ -44,8 +60,25 @@ class Decorator
 }
 */
 
-class ScribuntoBackend extends FileBackendStore {
+class ScribuntoOutput extends UploadBase {
+	function __construct($path) {
+		parent::__construct();
+		$this->mTempPath = $path;
+	}
+	public function initializeFromRequest(&$request) {
+		throw new NotImplementedException();
+	}
+	public function verifyFile() {
+		global $wgVerifyMimeType;
+		$bu = $wgVerifyMimeType;
+		$wgVerifyMimeType = false;
+		$ver = parent::verifyFile();
+		$wgVerifyMimeType = $bu;
+		return $ver;
+	}
+}
 
+class ScribuntoBackend extends FileBackendStore {
 	function __construct($config) {
 		parent::__construct($config);
 		$this->thumbs = new FSFileBackend($config);
@@ -83,9 +116,9 @@ class ScribuntoBackend extends FileBackendStore {
 		$fragment = isset($parsed_url['fragment']) ? '#' . $parsed_url['fragment'] : '';
 		return "$scheme$user$pass$host$port$path$query$fragment";
 	}
+
 	protected function doStoreInternal( array $params ) {
 		self::t($params);
-		//wfMkdirParents("/tmp/" . dirname(parse_url($params["src"])["path"]), __METHOD__);
 		$url = parse_url($params["dst"]);
 		$url["path"] = substr($url["path"], 0, strrpos($url["path"],'/'));
 		$this->thumbs->prepare(["dir" => self::unparse_url($url)]);
@@ -135,22 +168,36 @@ class ScribuntoBackend extends FileBackendStore {
 		}
 	}
 
+	private static function mimeToExt($mime) {
+		return explode(" ", (new MimeMagic)->getExtensionsForType($mime))[0];
+	}
+
+	static function execTitle($title) {
+		list($out, $w, $h, $mime) = self::execScript($title);
+		$ext = self::mimeToExt($mime);
+		// Create a new temporary file with the same extension...
+		$fsFile = TempFSFile::factory( 'localcopy_', $ext );
+		if ( ! $fsFile ) {
+			throw new MWException("couldn't create module output image file");
+		}
+		$bytes = file_put_contents( $fsFile->getPath(), $out );
+		$verification = (new ScribuntoOutput( $fsFile->getPath() ))->verifyFile();
+		if ( $verification !== true ) {
+			throw new MWException("Verification of output ({$fsFile->getPath()}) failed: " . print_r($verification,1));
+		}
+		if ( $bytes !== strlen( $out ) ) {
+			$fsFile = null;
+			throw new MWException("couldn't write file");
+		}
+		return [$fsFile, $w, $h, $mime];
+	}
+
 	protected function doGetLocalCopyMulti( array $params ) {
 		$tmpFiles = array(); // (path => TempFSFile)
 		foreach ( $params['srcs'] as $src ) {
-			if ( $src === null || !$this->doGetFileStat(["src" => $src])) {
-				$fsFile = null;
-			} else {
-				// Create a new temporary file with the same extension...
-				$ext = "svg"; //FileBackend::extensionFromPath( $src );
-				$fsFile = TempFSFile::factory( 'localcopy_', $ext );
-				if ( $fsFile ) {
-					$out = $this->execScript(self::urlToTitle($src)[1]);
-					$bytes = file_put_contents( $fsFile->getPath(), $out );
-					if ( $bytes !== strlen( $out ) ) {
-						$fsFile = null;
-					}
-				}
+			$fsFile = null;
+			if ( $src !== null && $this->doGetFileStat(["src" => $src])) {
+				list($fsFile, $_w, $_h, $_mime) = self::execTitle(self::urlToTitle($src)[1]);
 			}
 			$tmpFiles[$src] = $fsFile;
 		}
@@ -174,7 +221,7 @@ class ScribuntoBackend extends FileBackendStore {
 		if ( !$title || $title->getNamespace() !== NS_MODULE || Scribunto::isDocPage( $title ) ) {
 			throw new ScribuntoException( 'scribunto-common-nosuchmodule' );
 		}
-		$engine = self::makeEngine();
+		$engine = self::makeEngine(); // TODO cache
 		$module = $engine->fetchModuleFromParser( $title );
 		if ( !$module ) {
 			throw new ScribuntoException( 'scribunto-common-nosuchmodule' );
@@ -185,13 +232,15 @@ class ScribuntoBackend extends FileBackendStore {
 	private static function execScript(Title $nt2) {
 		try {
 			list($title, $module) = self::checkCall($nt2);
-			$str = $module->invoke( "getImage", null );
-			$width = strval(intval(strval($module->invoke( "getWidth", null ))));
-			$height = strval(intval(strval($module->invoke( "getHeight", null ))));
+			$str = strval($module->invoke( "getImage", null ));
+			$mime = strval($module->invoke( "getMimeType", null ));
+			$width = intval($module->invoke( "getWidth", null ));
+			$height = intval($module->invoke( "getHeight", null ));
 		} catch (ScribuntoException $e) {
 			$msg = $e->getMessage();
 			$width = 800;
 			$height = 30;
+			$mime = "image/svg+xml";
 			$str = <<<END
 				<svg height="$height" width="$width" xmlns="http://www.w3.org/2000/svg">
 				<text x="0" y="15" fill="red">$msg</text>
@@ -199,7 +248,7 @@ class ScribuntoBackend extends FileBackendStore {
 END;
 		}
 		//$str = "<div><img width='$width' height='$height' src='data:image/svg+xml;base64," . base64_encode(strval($str)) . "' /></div>";
-		return $str;
+		return [$str, $width, $height, $mime];
 	}
 }
 
