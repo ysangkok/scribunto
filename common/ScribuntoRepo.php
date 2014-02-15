@@ -5,11 +5,12 @@ TODO
 - notimplemented issues?
 - errormsg i18n
 */
+define("EXTS", true);
 
 class ScribuntoFile extends File {
 	function __construct($title, $repo) {
 		if ( $title instanceof Title ) {
-			$this->title = $title; //File::normalizeTitle( $title, 'exception' );
+			$this->title = File::normalizeTitle( $title, 'exception' );
 			$this->name = $repo->getNameFromTitle( $title );
 		} else {
 			$this->name = basename( $path );
@@ -17,6 +18,16 @@ class ScribuntoFile extends File {
 		}
 		$this->repo = $repo;
 		$this->hasData = false;
+	}
+
+	static function mimeToExt($mime) {
+		static $mimeMagic;
+		if (!$mimeMagic) $mimeMagic = new MimeMagic;
+		return File::normalizeExtension(explode(" ", $mimeMagic->getExtensionsForType($mime))[0]);
+	}
+
+	public function getExtension() {
+		return self::mimeToExt($this->getMimeType());
 	}
 
 	public static function newFromTitle($title, $repo) {
@@ -39,7 +50,8 @@ class ScribuntoFile extends File {
 	}
 
 	public function getMimeType() {
-		$this->ensureHasData();
+		if (!$this->mime)
+			$this->mime = $this->repo->getBackend()->execMimeType(Title::newFromText($this->title->getText()));
 		return $this->mime;
 	}
 
@@ -50,11 +62,12 @@ class ScribuntoFile extends File {
 
 	private function ensureHasData() {
 		if (!$this->hasData)
-			list($this->fsFile, $this->w, $this->h, $this->mime, $this->numBytesWritten) = $this->repo->getBackend()->execTitle(Title::newFromText($this->title->getDBKey()));
+			list($this->fsFile, $this->w, $this->h, $this->numBytesWritten) = $this->repo->getBackend()->execTitle(Title::newFromText($this->title->getText()));
 		$this->hasData = true;
 	}
 }
 
+/*
 class Decorator 
 {
 	protected $foo;
@@ -71,6 +84,7 @@ class Decorator
 		return $ret;
 	}
 }
+*/
 
 class ScribuntoOutput extends UploadBase {
 	function __construct($path) {
@@ -96,15 +110,14 @@ class ScribuntoBackend extends FileBackendStore {
 	function __construct($config, $repo) {
 		parent::__construct($config);
 		$this->repo = $repo;
-		$this->thumbs = new Decorator(new FSFileBackend($config));
-		$this->larges = new Decorator(new FSFileBackend(["name" => "scrib", "wikiId" => "donkeyballs", "containerPaths" => ["scrib-public" => "/home/janus/core/images"]]));
+		$this->thumbs = new FSFileBackend($config);
 	}
 
 	private static function n() {
 		throw new NotImplementedException();
 	}
 
-	private static function t($params) {
+	private static function assertThumbnail($params) {
 		if (isset($params["dst"])) $key = "dst";
 		else if (isset($params["src"])) $key = "src";
 		else return;
@@ -134,7 +147,7 @@ class ScribuntoBackend extends FileBackendStore {
 	}
 
 	protected function doStoreInternal( array $params ) {
-		self::t($params);
+		self::assertThumbnail($params);
 		$url = parse_url($params["dst"]);
 		$url["path"] = substr($url["path"], 0, strrpos($url["path"],'/'));
 		$this->thumbs->prepare(["dir" => self::unparse_url($url)]);
@@ -178,7 +191,7 @@ class ScribuntoBackend extends FileBackendStore {
 			$orgfile = strrev(explode("/",strrev(dirname(parse_url($params["src"])["path"])))[0]);
 			// mwstore://bla/bla/næst sidste/john
 			//                   ^^^^^^^^^^^ == Module:Bananas == orgfile
-			if ($thumbStat["mtime"] < (new WikiPage(Title::newFromText($orgfile)))->getTouched()) {
+			if ($thumbStat["mtime"] < (new WikiPage(self::stripExt(Title::newFromText($orgfile))[0]))->getTouched()) {
 				wfDebugLog(__METHOD__, "forced thumbnail regeneration: " . print_r($thumbStat,1));
 				$this->thumbs->quickDelete($params);
 				return $this->thumbs->getFileStat($params);
@@ -187,45 +200,56 @@ class ScribuntoBackend extends FileBackendStore {
 				return $thumbStat;
 			}
 		}
+		if (EXTS) {
+			if (strpos($module->getText(),".") === false) return null; // no dot in filename
+			list ($module2, $strippedExt) = self::stripExt($module);
+		} else {
+			$module2 = $module;
+		}
+		$page = new WikiPage($module2);
+		if (!$page->exists()) return null; //throw new MWException("page don't exist " . $module2->getPrefixedText());
 		try {
-			self::checkCall($module);
-			$page = new WikiPage($module);
-			return ["mtime" => $page->getTouched(), "size" => $this->execTitle($module)[4]];
-		} catch (ScribuntoException $e) {
+			return ["mtime" => $page->getTouched(), "size" => $this->execTitle($module)[3]];
+		} catch (ExtensionException $e) {
 			return null;
 		}
 	}
 
-	private static function mimeToExt($mime) {
-		static $mimeMagic;
-		if (!$mimeMagic) $mimeMagic = new MimeMagic;
-		return explode(" ", $mimeMagic->getExtensionsForType($mime))[0];
-	}
-
 	function execTitle($title) {
-		list($out, $w, $h, $mime) = self::execScript($title);
-		$ext = self::mimeToExt($mime);
-		// Create a new temporary file with the same extension...
-		$fsFile = TempFSFile::factory( 'localcopy_', $ext );
-		if ( ! $fsFile ) {
-			throw new MWException("couldn't create module output image file");
+		$endfile = ScribuntoFile::newFromModuleTitle($title, $this->repo);
+		$fsFile = TempFSFile::factory( 'localcopy_', $endfile->getExtension() );
+		try {
+			list($out, $w, $h) = self::execScript($title);
+			if ( ! $fsFile ) {
+				throw new MWException("couldn't create module output image file");
+			}
+			$bytes = file_put_contents( $fsFile->getPath(), $out );
+			$verification = (new ScribuntoOutput( $fsFile->getPath() ))->verifyFile();
+			if ( $verification !== true ) {
+				throw new MWException("Verification of output ({$fsFile->getPath()}) failed: " . print_r($verification,1));
+			}
+			if ( $bytes !== strlen( $out ) ) {
+				$fsFile = null;
+				throw new MWException("couldn't write file");
+			}
+			$url = $endfile->getPath();
+			$split = parse_url($url);
+			$split["path"] = dirname($split["path"]);
+			$newurl = self::unparse_url($split);
+			$this->thumbs->prepare(["dir" => $newurl]);
+			$this->thumbs->quickStore(["src" => $fsFile->getPath(), "dst" => $url]);
+		} catch (Exception $e) {
+			$msg = $e->getMessage();
+			$w = 500;
+			$h = 30;
+			$str = <<<END
+				<svg height="$height" width="$width" xmlns="http://www.w3.org/2000/svg">
+				<text x="0" y="10" fill="red">$msg</text>
+				</svg>
+END;
+			$bytes = file_put_contents($fsFile->getPath(), $str); 
 		}
-		$bytes = file_put_contents( $fsFile->getPath(), $out );
-		$verification = (new ScribuntoOutput( $fsFile->getPath() ))->verifyFile();
-		if ( $verification !== true ) {
-			throw new MWException("Verification of output ({$fsFile->getPath()}) failed: " . print_r($verification,1));
-		}
-		if ( $bytes !== strlen( $out ) ) {
-			$fsFile = null;
-			throw new MWException("couldn't write file");
-		}
-		$url = ScribuntoFile::newFromModuleTitle($title, $this->repo)->getPath();
-		$split = parse_url($url);
-		$split["path"] = dirname($split["path"]);
-		$newurl = self::unparse_url($split);
-		$this->larges->prepare(["dir" => $newurl]);
-		$this->larges->quickStore(["src" => $fsFile->getPath(), "dst" => $url]);
-		return [$fsFile, $w, $h, $mime, $bytes];
+		return [$fsFile, $w, $h, $bytes];
 	}
 
 	protected function doGetLocalCopyMulti( array $params ) {
@@ -235,7 +259,7 @@ class ScribuntoBackend extends FileBackendStore {
 			if ( $src !== null && $this->doGetFileStat(["src" => $src])) {
 				list($bucket, $title) = self::urlToBucketAndTitle($src);
 				if (in_array($bucket, ["thumb", "archive", "deleted", "temp", "math"])) throw new MWException("unexpected bucket $bucket");
-				list($fsFile, $_w, $_h, $_mime, $_numBytesWritten) = self::execTitle($title);
+				list($fsFile, $_w, $_h, $_numBytesWritten) = self::execTitle($title);
 			}
 			$tmpFiles[$src] = $fsFile;
 		}
@@ -257,9 +281,19 @@ class ScribuntoBackend extends FileBackendStore {
 		return $engine;
 	}
 
+	static function stripExt($title) {
+		if (!EXTS) return [$title, null];
+		$t = $title->getPrefixedText();
+		$pos = strrpos($t, ".");
+		if ($pos === false) throw new MWException("assertion error!");
+		$strippedExt = substr($t, $pos+1);
+		$withoutExt = strstr($t, '.', true);
+		return [Title::newFromText($withoutExt), $strippedExt];
+	}
+
 	private static function checkCall($title) {
+		list ($title, $strippedExt) = self::stripExt($title);
 		if ( !$title || $title->getNamespace() !== NS_MODULE || Scribunto::isDocPage( $title ) ) {
-			throw new MWException($title);
 			throw new ScribuntoException( 'scribunto-common-nosuchmodule' );
 		}
 		$engine = self::makeEngine();
@@ -270,28 +304,27 @@ class ScribuntoBackend extends FileBackendStore {
 		return [$title, $module];
 	}
 
-	private static function execScript(Title $nt2) {
-		try {
-			list($title, $module) = self::checkCall($nt2);
-			$str = strval($module->invoke( "getImage", null ));
-			$mime = strval($module->invoke( "getMimeType", null ));
-			$width = intval($module->invoke( "getWidth", null ));
-			$height = intval($module->invoke( "getHeight", null ));
-			if ($width < 1 || $height < 1) throw new MWException("Width and height must be positive!");
-		} catch (Exception $e) {
-			$msg = $e->getMessage();
-			$width = 500;
-			$height = 30;
-			$mime = "image/svg+xml";
-			$str = <<<END
-				<svg height="$height" width="$width" xmlns="http://www.w3.org/2000/svg">
-				<text x="0" y="15" fill="red">$msg</text>
-				</svg>
-END;
-		}
-		//$str = "<div><img width='$width' height='$height' src='data:image/svg+xml;base64," . base64_encode(strval($str)) . "' /></div>";
-		return [$str, $width, $height, $mime];
+	static function execMimeType(Title $nt) {
+		list($title, $module) = self::checkCall($nt);
+		$mimeType = strval($module->invoke( "getMimeType", null ));
+		$a = ScribuntoFile::mimeToExt($mimeType);
+		$b = self::stripExt($nt)[1];
+		if (EXTS && $a !== $b)
+			throw new ExtensionException("Wrong extension! {$nt->__toString()} " . var_export($a,1) . " !== " . var_export($b,1) );
+		return $mimeType;
 	}
+
+	private static function execScript(Title $nt2) {
+		list($title, $module) = self::checkCall($nt2);
+		$str = strval($module->invoke( "getImage", null ));
+		$width = intval($module->invoke( "getWidth", null ));
+		$height = intval($module->invoke( "getHeight", null ));
+		if ($width < 1 || $height < 1) throw new MWException("Width and height must be positive!");
+		return [$str, $width, $height];
+	}
+}
+
+class ExtensionException extends MWException {
 }
 
 class ScribuntoRepo extends FileRepo {
@@ -299,6 +332,7 @@ class ScribuntoRepo extends FileRepo {
 
 	function __construct($arr) {
 		parent::__construct($arr/* + ["hashLevels" => 0]*/); // this takes the "url" param
+		xdebug_disable();
 		//xdebug_start_trace("/tmp/trace.out");
 		$this->backend = new ScribuntoBackend($arr, $this);
 	}
