@@ -190,9 +190,7 @@ abstract class Scribunto_LuaEngine extends ScribuntoEngineBase {
 			'parent' => isset( $frame->parent ) ? $frame->parent : null,
 		);
 		try {
-			$result = $this->getInterpreter()->callFunction(
-				$this->mw['executeFunction'],
-				$chunk );
+			$result = $this->executeModule($chunk);
 		} catch ( Exception $ex ) {
 			$this->currentFrames = $oldFrames;
 			throw $ex;
@@ -669,7 +667,12 @@ class Scribunto_LuaModule extends ScribuntoModuleBase {
 			throw $this->engine->newException( 'scribunto-common-nosuchfunction' );
 		}
 
-		$result = $this->engine->executeFunctionChunk( $exports[$name], $frame );
+		if ($frame) {
+			$result = $this->engine->executeFunctionChunk( $exports[$name], $frame );
+		} else {
+			$result = $this->engine->executeModule( $exports[$name] );
+		}
+
 		if ( isset( $result[0] ) ) {
 			return $result[0];
 		} else {

@@ -1,0 +1,12 @@
+<phpunit>
+	<filter>
+		<whitelist processUncoveredFilesFromWhitelist="true">
+			<file>/home/janus/core/extensions/Scribunto/common/ScribuntoRepo.php</file>
+		</whitelist>
+	</filter>
+	<testsuites>
+		<testsuite name="Scribunto Repo Test Suite">
+			<file>extensions/Scribunto/tests/ScribuntoRepoTest.php</file>
+		</testsuite>
+	</testsuites>
+</phpunit>
